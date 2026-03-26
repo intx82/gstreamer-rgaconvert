@@ -59,6 +59,12 @@ GST_DEBUG_CATEGORY_STATIC(gst_rga_convert_debug_category);
 
 /* prototypes */
 
+typedef enum {
+    GST_RGA_MEM_MODE_AUTO = 0,
+    GST_RGA_MEM_MODE_HANDLE,
+    GST_RGA_MEM_MODE_VIRTUAL,
+} GstRgaMemMode;
+
 static gboolean gst_rga_convert_start(GstBaseTransform *trans);
 static gboolean gst_rga_convert_stop(GstBaseTransform *trans);
 
@@ -203,10 +209,26 @@ static gboolean gst_rga_get_frame_geometry(GstVideoFrame *frame, RgaSURF_FORMAT 
     *vstride = vs;
     return TRUE;
 }
-static gboolean
-gst_rga_import_video_frame_im2d(GstVideoFrame *frame,
-                                GstMapFlags map_flags,
-                                GstRgaIm2dFrame *out)
+
+static gboolean gst_rga_frame_can_use_handle(GstVideoFrame *frame)
+{
+    GstBuffer *buffer = frame->buffer;
+
+    if (gst_buffer_n_memory(buffer) != 1) {
+        return FALSE;
+    }
+
+    GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
+    if (!gst_is_dmabuf_memory(mem)) {
+        return FALSE;
+    }
+
+    gsize offset = 0;
+    gst_memory_get_sizes(mem, &offset, NULL);
+    return offset == 0;
+}
+
+static gboolean gst_rga_import_video_frame_im2d(GstVideoFrame *frame, GstMapFlags map_flags, GstRgaMemMode mem_mode, GstRgaIm2dFrame *out)
 {
     GstBuffer *buffer;
     RgaSURF_FORMAT fmt;
@@ -223,9 +245,8 @@ gst_rga_import_video_frame_im2d(GstVideoFrame *frame,
 
     memset(out, 0, sizeof(*out));
 
-    if (!gst_rga_get_frame_geometry(frame, &fmt, &width, &height, &hstride, &vstride)) {
+    if (!gst_rga_get_frame_geometry(frame, &fmt, &width, &height, &hstride, &vstride))
         return FALSE;
-    }
 
     buffer = frame->buffer;
     buf_size = gst_buffer_get_size(buffer);
@@ -248,7 +269,12 @@ gst_rga_import_video_frame_im2d(GstVideoFrame *frame,
     param.format = (uint32_t)fmt;
 #endif
 
-    if (fd >= 0) {
+    if (mem_mode == GST_RGA_MEM_MODE_HANDLE) {
+        if (fd < 0) {
+            GST_ERROR("HANDLE mode requested but no importable dmabuf fd is available");
+            return FALSE;
+        }
+
 #ifdef RGA_IMPORT_USE_PARAM
         out->handle = importbuffer_fd(fd, &param);
 #else
@@ -258,32 +284,35 @@ gst_rga_import_video_frame_im2d(GstVideoFrame *frame,
             GST_ERROR("importbuffer_fd(%d, %zu) failed", fd, (size_t)buf_size);
             return FALSE;
         }
+
         out->imported = TRUE;
-    } else {
+        out->mapped = FALSE;
+        out->buffer = wrapbuffer_handle(out->handle, width, height, fmt, hstride, vstride);
+        return TRUE;
+    }
+
+    if (mem_mode == GST_RGA_MEM_MODE_VIRTUAL || mem_mode == GST_RGA_MEM_MODE_AUTO) {
         if (!gst_buffer_map(buffer, &out->map_info, map_flags)) {
             GST_ERROR("gst_buffer_map failed");
             return FALSE;
         }
 
         out->mapped = TRUE;
+        out->imported = FALSE;
 
-#ifdef RGA_IMPORT_USE_PARAM
-        out->handle = importbuffer_virtualaddr(out->map_info.data, &param);
-#else
-        out->handle = importbuffer_virtualaddr(out->map_info.data, (int)buf_size);
-#endif
-        if (!out->handle) {
-            GST_ERROR("importbuffer_virtualaddr(%p, %zu) failed",
-                      out->map_info.data, (size_t)buf_size);
+        if (!out->map_info.data) {
+            GST_ERROR("gst_buffer_map returned NULL data");
             gst_buffer_unmap(buffer, &out->map_info);
             out->mapped = FALSE;
             return FALSE;
         }
-        out->imported = TRUE;
+
+        out->buffer = wrapbuffer_virtualaddr_t(out->map_info.data, width, height, hstride, vstride, fmt);
+        return TRUE;
     }
 
-    out->buffer = wrapbuffer_handle(out->handle, width, height, fmt, hstride, vstride);
-    return TRUE;
+    GST_ERROR("Unknown memory mode %d", (int)mem_mode);
+    return FALSE;
 }
 
 static void gst_rga_release_video_frame_im2d(GstVideoFrame *frame, GstRgaIm2dFrame *im2d_frame)
@@ -392,6 +421,7 @@ static GstFlowReturn gst_rga_convert_transform_frame(GstVideoFilter *filter, Gst
     im_rect src_rect;
     im_rect dst_rect;
     IM_STATUS status;
+    GstRgaMemMode mem_mode = GST_RGA_MEM_MODE_VIRTUAL;
 
     GST_DEBUG_OBJECT(rgaconvert, "transform_frame");
 
@@ -400,16 +430,23 @@ static GstFlowReturn gst_rga_convert_transform_frame(GstVideoFilter *filter, Gst
     memset(&src_rect, 0, sizeof(src_rect));
     memset(&dst_rect, 0, sizeof(dst_rect));
 
-    if (!gst_rga_get_frame_geometry(inframe, &src_fmt, &src_w, &src_h, &src_hs, &src_vs))
+    if (!gst_rga_get_frame_geometry(inframe, &src_fmt, &src_w, &src_h, &src_hs, &src_vs)) {
         return GST_FLOW_ERROR;
+    }
 
-    if (!gst_rga_get_frame_geometry(outframe, &dst_fmt, &dst_w, &dst_h, &dst_hs, &dst_vs))
+    if (!gst_rga_get_frame_geometry(outframe, &dst_fmt, &dst_w, &dst_h, &dst_hs, &dst_vs)) {
         return GST_FLOW_ERROR;
+    }
 
-    if (!gst_rga_import_video_frame_im2d(inframe, GST_MAP_READ, &src))
+    if (gst_rga_frame_can_use_handle(inframe) && gst_rga_frame_can_use_handle(outframe)) {
+        mem_mode = GST_RGA_MEM_MODE_HANDLE;
+    }
+
+    if (!gst_rga_import_video_frame_im2d(inframe, GST_MAP_READ, mem_mode, &src)) {
         return GST_FLOW_ERROR;
+    }
 
-    if (!gst_rga_import_video_frame_im2d(outframe, GST_MAP_WRITE, &dst)) {
+    if (!gst_rga_import_video_frame_im2d(outframe, GST_MAP_WRITE, mem_mode, &dst)) {
         gst_rga_release_video_frame_im2d(inframe, &src);
         return GST_FLOW_ERROR;
     }
